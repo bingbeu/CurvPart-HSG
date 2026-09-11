@@ -229,6 +229,14 @@ def get_args_parser():
     parser.add_argument('--meta-start-epoch', default=5, type=int,
                         help='warm up semantic tokens before enabling the meta step')
     parser.add_argument('--meta-q', default='uniform', choices=['uniform', 'hvp'])
+    parser.add_argument('--meta-scope', default='relation',
+                        choices=['part', 'relation', 'hybrid'],
+                        help='V6 defaults to configuration relations; hybrid also keeps V5 parts')
+    parser.add_argument('--meta-relation-weight', default=1.0, type=float)
+    parser.add_argument('--relation-hvp-samples', default=1, type=int,
+                        help='Hutchinson probes for relation-level HVP curvature')
+    parser.add_argument('--no-relation-hvp', action='store_true',
+                        help='replace relation HVP by its endpoint part-curvature prior')
     
     
     return parser
@@ -348,6 +356,9 @@ def main(args):
         meta_policy_hidden=args.meta_policy_hidden,
         meta_policy_tau=args.meta_policy_tau,
         meta_reference_mix=args.meta_reference_mix,
+        meta_scope=args.meta_scope,
+        relation_hvp_samples=args.relation_hvp_samples,
+        enable_relation_hvp=(not args.no_relation_hvp),
     )
     print(model)
                     
@@ -435,14 +446,20 @@ def main(args):
         args.lr = linear_scaled_lr
     meta_optimizer = None
     policy_params = []
+    all_policy_params = []
     if args.enable_bilevel:
-        policy_params = list(model_without_ddp.bilevel.policy.parameters())
+        policy_params = list(
+            model_without_ddp.bilevel.policy_parameters(args.meta_scope)
+        )
+        all_policy_params = list(
+            model_without_ddp.bilevel.all_policy_parameters()
+        )
         # The main optimizer must never update phi from task/alignment losses.
-        for param in policy_params:
+        for param in all_policy_params:
             param.requires_grad_(False)
     optimizer = create_optimizer(args, model_without_ddp)
     if args.enable_bilevel:
-        for param in policy_params:
+        for param in all_policy_params:
             param.requires_grad_(True)
         meta_optimizer = torch.optim.AdamW(
             policy_params,

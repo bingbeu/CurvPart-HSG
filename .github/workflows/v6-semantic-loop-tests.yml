@@ -1,0 +1,23 @@
+name: V6 semantic loop tests
+
+on:
+  push:
+    branches:
+      - "codex/relation-bilevel-v6"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gradient-invariants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install CPU PyTorch
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Compile sources
+        run: python -m compileall -q deit
+      - name: Check HVP and bilevel gradients
+        run: PYTHONPATH=deit python -m unittest -v deit/test_semantic_bilevel.py

@@ -82,8 +82,18 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         else:
             raise ValueError('Unknown dataset')
 
+        meta_active = (
+            getattr(args, 'enable_bilevel', False)
+            and epoch >= getattr(args, 'meta_start_epoch', 0)
+        )
+
         with torch.cuda.amp.autocast():
-            out = model(support_samples, caps_embed)
+            out = model(
+                support_samples,
+                caps_embed,
+                # Avoid relation-level second derivatives during warm-up.
+                compute_hvp=(meta_active if args.enable_bilevel else None),
+            )
             sim_loss = torch.tensor(0.0)  
             outputs, sub_out, basic_out, feats, family_feat, order_feat, part_aux_loss, *extra = out
             support_meta_state = extra[0] if extra else None
@@ -136,10 +146,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
 
         meta_stats = {}
         meta_real_loss = torch.zeros((), device=device)
-        meta_active = (
-            getattr(args, 'enable_bilevel', False)
-            and epoch >= getattr(args, 'meta_start_epoch', 0)
-        )
         if meta_active:
             if query_samples is None:
                 raise RuntimeError(
@@ -167,8 +173,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     inner_lr=args.meta_inner_lr,
                     q_mode=args.meta_q,
                     kl_weight=args.meta_kl_weight,
+                    scope=args.meta_scope,
+                    relation_weight=args.meta_relation_weight,
                 )
-            policy_params = tuple(core_model.bilevel.policy.parameters())
+            policy_params = tuple(
+                core_model.bilevel.policy_parameters(args.meta_scope)
+            )
             policy_grads = torch.autograd.grad(
                 meta_loss, policy_params, allow_unused=False
             )
@@ -186,7 +196,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             # Real model step: p is recomputed after the meta update and detached
             # inside this loss, so no direct weighted-error gradient reaches phi.
             meta_real_loss, real_stats = core_model.bilevel.real_weighted_alignment(
-                support_meta_state
+                support_meta_state,
+                scope=args.meta_scope,
+                relation_weight=args.meta_relation_weight,
             )
             meta_stats.update(real_stats)
 

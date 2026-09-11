@@ -391,6 +391,10 @@ class SemanticPartTokenGeneratorV4(nn.Module):
                 "curv_entropy": curv_entropy.detach(),
                 "part_curvature": part_curvature.detach(),
                 "part_attn": attn.detach(),
+                # V6 relation geometry needs a live attention tensor so the
+                # ordinary relation loss can refine spatial part assignment.
+                # The HVP teacher detaches it again before second derivatives.
+                "part_attn_live": attn,
                 "attr_attn": attr_attn.detach(),
                 "part_assign": part_assign.detach(),
                 "per_token_sim": per_token_sim.detach(),

@@ -43,6 +43,9 @@ class HierVisionTransformer(VisionTransformer):
         meta_reference_mix = kwargs.pop('meta_reference_mix', 0.5)
         semantic_diversity_weight = kwargs.pop('semantic_diversity_weight', 0.01)
         semantic_bridge_weight = kwargs.pop('semantic_bridge_weight', 0.1)
+        meta_scope = kwargs.pop('meta_scope', 'relation')
+        relation_hvp_samples = kwargs.pop('relation_hvp_samples', 1)
+        enable_relation_hvp = kwargs.pop('enable_relation_hvp', True)
 
         super().__init__(*args, **kwargs)
         #self.pos_embed = nn.Parameter(torch.randn(1, self.embed_len, self.embed_dim) * .02)
@@ -99,6 +102,14 @@ class HierVisionTransformer(VisionTransformer):
         # Classification always uses visual semantic tokens, so train and test
         # follow the same path. Captions are only a training-time teacher.
         self.enable_bilevel = bool(enable_bilevel)
+        if meta_scope not in BilevelSemanticController.VALID_SCOPES:
+            raise ValueError(
+                'meta_scope must be one of {}'.format(
+                    BilevelSemanticController.VALID_SCOPES
+                )
+            )
+        self.meta_scope = meta_scope
+        self.enable_relation_hvp = bool(enable_relation_hvp)
         self.semantic_bridge_weight = float(semantic_bridge_weight)
         if self.enable_bilevel:
             self.bilevel = BilevelSemanticController(
@@ -111,7 +122,20 @@ class HierVisionTransformer(VisionTransformer):
                 policy_tau=meta_policy_tau,
                 reference_mix=meta_reference_mix,
                 diversity_weight=semantic_diversity_weight,
+                enable_relations=(meta_scope in ('relation', 'hybrid')),
+                relation_hvp_samples=relation_hvp_samples,
             )
+            if meta_scope in ('relation', 'hybrid'):
+                # Independent zero-gated configuration residual.  CUB can keep
+                # this gate near zero while Aircraft can activate relations.
+                self.relation_cls_adapter = nn.Sequential(
+                    nn.LayerNorm(self.embed_dim),
+                    nn.Linear(self.embed_dim, self.embed_dim),
+                    nn.GELU(),
+                    nn.Linear(self.embed_dim, self.embed_dim),
+                )
+                self.relation_cls_adapter.apply(self._init_weights)
+                self.relation_gate = nn.Parameter(torch.zeros(()))
 
     def forward_features(self, x):
         # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
@@ -152,6 +176,7 @@ class HierVisionTransformer(VisionTransformer):
             visual_semantics = None
             text_semantics = None
             meta_state = None
+            relation_feat = None
             if self.enable_bilevel:
                 # P distinct visual semantic tokens are used in both train/eval.
                 visual_semantics = self.bilevel.visual_semantics(cls_s)
@@ -189,6 +214,21 @@ class HierVisionTransformer(VisionTransformer):
                     target_semantics,
                     aux['part_curvature'],
                 )
+                if self.meta_scope in ('relation', 'hybrid'):
+                    relation_compute_hvp = (
+                        self.enable_relation_hvp
+                        and (self.training if compute_hvp is None else bool(compute_hvp))
+                    )
+                    relation_state = self.bilevel.make_relation_state(
+                        part_tokens,
+                        visual_semantics,
+                        target_semantics,
+                        aux['part_attn_live'],
+                        aux['part_curvature'],
+                        compute_hvp=relation_compute_hvp,
+                    )
+                    meta_state['relation_state'] = relation_state
+                    relation_feat, _ = self.bilevel.pool_relations(relation_state)
             else:
                 part_feat = part_tokens.mean(dim=1)
 
@@ -197,7 +237,13 @@ class HierVisionTransformer(VisionTransformer):
             gate = torch.tanh(self.part_gate)                     # (3,)，初始 0
             cls_f = self.norm(intermediates[3][:, 0])             # 科级 CLS
             cls_o = self.norm(intermediates[2][:, 0])             # 目级 CLS
-            out = self.head(cls_s + gate[0] * delta)
+            fine_feature = cls_s + gate[0] * delta
+            if relation_feat is not None:
+                relation_delta = self.relation_cls_adapter(relation_feat)
+                fine_feature = (
+                    fine_feature + torch.tanh(self.relation_gate) * relation_delta
+                )
+            out = self.head(fine_feature)
             family_out = self.family_head(cls_f)
             manu_out = self.manufacturer_head(cls_o)
 
@@ -243,6 +289,8 @@ class HierVisionTransformer(VisionTransformer):
         # 门控(0 维标量)/可学习 token 不落入 timm 的 decay 组（timm 只用 len(shape)==1 判定）
         nd = set(super().no_weight_decay())
         nd.update({'category_token', 'attr_proto', 'part_gate'})
+        if hasattr(self, 'relation_gate'):
+            nd.add('relation_gate')
         if self.enable_bilevel:
             nd.update({
                 'bilevel.bridge.anchors',
@@ -495,4 +543,3 @@ def deit_conv_base_patch16_224(pretrained=False, **kwargs):
         norm_layer=partial(nn.LayerNorm, eps=1e-6), embed_layer=ConvStem, **kwargs)
     model.default_cfg = _cfg()
     return model
-
