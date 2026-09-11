@@ -364,6 +364,16 @@ class SemanticPartTokenGeneratorV4(nn.Module):
             + self.part_queries.expand(B, -1, -1).to(part_tokens.dtype)
         )
 
+        # Aggregate patch-level HVP/student curvature to the semantic-part level.
+        # The detached value is used as an input prior by the bilevel policy; no
+        # third-order gradient is allowed through the HVP computation.
+        part_curvature = (
+            attn.detach() * curvature.detach().transpose(1, 2)
+        ).sum(dim=-1)
+        part_curvature = part_curvature / part_curvature.mean(
+            dim=1, keepdim=True
+        ).clamp_min(self.eps)
+
         if return_aux:
             return part_tokens, {
                 "align_loss": align_loss,
@@ -379,6 +389,8 @@ class SemanticPartTokenGeneratorV4(nn.Module):
                 "curv_weight_max": curv_weight.max().detach(),
                 "curv_weight_mean": curv_weight.mean().detach(),
                 "curv_entropy": curv_entropy.detach(),
+                "part_curvature": part_curvature.detach(),
+                "part_attn": attn.detach(),
                 "attr_attn": attr_attn.detach(),
                 "part_assign": part_assign.detach(),
                 "per_token_sim": per_token_sim.detach(),
