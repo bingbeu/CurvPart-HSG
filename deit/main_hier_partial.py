@@ -18,7 +18,7 @@ from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
-from datasets_partial import build_dataset
+from datasets_partial import build_dataset, TwoViewTransform
 from datasets import build_dataset as build_dataset_test
 
 from engine_vit_hier_partial import train_one_epoch, evaluate
@@ -209,6 +209,26 @@ def get_args_parser():
     parser.add_argument('--curv-reg-weight', default=0.05, type=float)
     parser.add_argument('--proto-align-weight', default=0.1, type=float)
     parser.add_argument('--no-hvp', action='store_true', help='disable HVP curvature teacher')
+
+    # ---- V5: curvature-guided bilevel semantic feedback loop ----
+    parser.add_argument('--enable-bilevel', action='store_true')
+    parser.add_argument('--semantic-rank', default=64, type=int)
+    parser.add_argument('--semantic-bridge-weight', default=0.1, type=float)
+    parser.add_argument('--semantic-diversity-weight', default=0.01, type=float)
+    parser.add_argument('--meta-adapter-rank', default=64, type=int)
+    parser.add_argument('--meta-policy-hidden', default=128, type=int)
+    parser.add_argument('--meta-policy-tau', default=1.0, type=float)
+    parser.add_argument('--meta-reference-mix', default=0.5, type=float,
+                        help='rho in p=(1-rho)q+rho*softmax(logits/tau)')
+    parser.add_argument('--meta-inner-lr', default=0.1, type=float)
+    parser.add_argument('--meta-lr', default=1e-4, type=float)
+    parser.add_argument('--meta-weight-decay', default=1e-4, type=float)
+    parser.add_argument('--meta-real-weight', default=0.1, type=float)
+    parser.add_argument('--meta-kl-weight', default=0.01, type=float)
+    parser.add_argument('--meta-clip-grad', default=5.0, type=float)
+    parser.add_argument('--meta-start-epoch', default=5, type=int,
+                        help='warm up semantic tokens before enabling the meta step')
+    parser.add_argument('--meta-q', default='uniform', choices=['uniform', 'hvp'])
     
     
     return parser
@@ -280,7 +300,10 @@ def main(args):
         drop_last=True,
     )
     if args.ThreeAugment:
-        data_loader_train.dataset.transform = new_data_aug_generator(args)
+        train_transform = new_data_aug_generator(args)
+        if args.enable_bilevel:
+            train_transform = TwoViewTransform(train_transform)
+        data_loader_train.dataset.transform = train_transform
 
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler_val,
@@ -317,6 +340,14 @@ def main(args):
         global_align_weight=args.global_align_weight,
         curv_reg_weight=args.curv_reg_weight,
         proto_align_weight=args.proto_align_weight,
+        enable_bilevel=args.enable_bilevel,
+        semantic_rank=args.semantic_rank,
+        semantic_bridge_weight=args.semantic_bridge_weight,
+        semantic_diversity_weight=args.semantic_diversity_weight,
+        meta_adapter_rank=args.meta_adapter_rank,
+        meta_policy_hidden=args.meta_policy_hidden,
+        meta_policy_tau=args.meta_policy_tau,
+        meta_reference_mix=args.meta_reference_mix,
     )
     print(model)
                     
@@ -391,14 +422,33 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.gpu],
+            find_unused_parameters=args.enable_bilevel,
+        )
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
     if not args.unscale_lr:
         linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
         args.lr = linear_scaled_lr
+    meta_optimizer = None
+    policy_params = []
+    if args.enable_bilevel:
+        policy_params = list(model_without_ddp.bilevel.policy.parameters())
+        # The main optimizer must never update phi from task/alignment losses.
+        for param in policy_params:
+            param.requires_grad_(False)
     optimizer = create_optimizer(args, model_without_ddp)
+    if args.enable_bilevel:
+        for param in policy_params:
+            param.requires_grad_(True)
+        meta_optimizer = torch.optim.AdamW(
+            policy_params,
+            lr=args.meta_lr,
+            weight_decay=args.meta_weight_decay,
+        )
     loss_scaler = NativeScaler()
 
     lr_scheduler, _ = create_scheduler(args, optimizer)
@@ -457,6 +507,8 @@ def main(args):
                 utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
+            if meta_optimizer is not None and checkpoint.get('meta_optimizer') is not None:
+                meta_optimizer.load_state_dict(checkpoint['meta_optimizer'])
         lr_scheduler.step(args.start_epoch)
     if args.eval:
         test_stats = evaluate_detail(data_loader_val, model, device, args.filename, len(args.nb_classes), args.data_set, args.texts)
@@ -476,6 +528,7 @@ def main(args):
             args.clip_grad, model_ema, mixup_fn,
             set_training_mode=args.train_mode,  # keep in eval mode for deit finetuning / train mode for training and deit III finetuning
             args = args,
+            meta_optimizer=meta_optimizer,
         )
 
         lr_scheduler.step(epoch)
@@ -490,6 +543,9 @@ def main(args):
                     'accuracy': max_accuracy,
                     'model_ema': get_state_dict(model_ema),
                     'scaler': loss_scaler.state_dict(),
+                    'meta_optimizer': (
+                        meta_optimizer.state_dict() if meta_optimizer is not None else None
+                    ),
                     'args': args,
                 }, checkpoint_path)
              
@@ -510,6 +566,9 @@ def main(args):
                         'accuracy': max_accuracy,
                         'model_ema': get_state_dict(model_ema),
                         'scaler': loss_scaler.state_dict(),
+                        'meta_optimizer': (
+                            meta_optimizer.state_dict() if meta_optimizer is not None else None
+                        ),
                         'args': args,
                     }, checkpoint_path)
             

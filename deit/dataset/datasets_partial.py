@@ -27,6 +27,22 @@ import inat21_mini_cap
 import inat21_mini_seeds_cap
 
 
+class TwoViewTransform:
+    """Return independent support/query augmentations of the same image."""
+
+    def __init__(self, transform):
+        self.transform = transform
+
+    def __call__(self, image):
+        return self.transform(image), self.transform(image)
+
+
+def _maybe_two_view(transform, is_train, args):
+    if is_train and getattr(args, 'enable_bilevel', False):
+        return TwoViewTransform(transform)
+    return transform
+
+
 
 def build_dataset(is_train, args):
     transform = build_transform(is_train, args)
@@ -205,7 +221,7 @@ def build_transform(is_train, args):
             # RandomCrop
             transform.transforms[0] = transforms.RandomCrop(
                 args.input_size, padding=4)
-        return transform
+        return _maybe_two_view(transform, is_train, args)
 
     t = []
     if resize_im:
@@ -220,4 +236,4 @@ def build_transform(is_train, args):
         t.append(transforms.Normalize([0.466, 0.471, 0.380], [0.195, 0.194, 0.192]))
     else:
         t.append(transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD))
-    return transforms.Compose(t)
+    return _maybe_two_view(transforms.Compose(t), is_train, args)
