@@ -8,6 +8,7 @@ import sys
 from typing import Iterable, Optional
 
 import torch
+import torch.distributed as dist
 
 from mixup_hier import Mixup # we do not use mixup here. 
 from timm.utils import accuracy, ModelEma
@@ -24,7 +25,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True, args = None):
+                    set_training_mode=True, args = None, meta_optimizer=None):
     model.train(set_training_mode)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -46,9 +47,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         #if args.texts is not None:
         samples, targets, fine_targets, sub_targets, basic_targets, caps_embed = data
         caps_embed = caps_embed.to(device, non_blocking=True)
+        caps_model_embed = caps_embed
         # else:
         #     samples, targets, fine_targets, sub_targets, basic_targets = data
-        samples = samples.to(device, non_blocking=True)
+        if isinstance(samples, (tuple, list)):
+            if len(samples) != 2:
+                raise ValueError("bilevel training expects exactly two augmented views")
+            support_samples = samples[0].to(device, non_blocking=True)
+            query_samples = samples[1].to(device, non_blocking=True)
+        else:
+            support_samples = samples.to(device, non_blocking=True)
+            query_samples = None
         targets = targets.to(device, non_blocking=True)
         fine_targets = fine_targets.to(device, non_blocking=True)
         sub_targets = sub_targets.to(device, non_blocking=True)
@@ -74,12 +83,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             raise ValueError('Unknown dataset')
 
         with torch.cuda.amp.autocast():
-            out = model(samples, caps_embed)
+            out = model(support_samples, caps_embed)
             sim_loss = torch.tensor(0.0)  
-            outputs, sub_out, basic_out, feats, family_feat, order_feat, part_aux_loss  = out
+            outputs, sub_out, basic_out, feats, family_feat, order_feat, part_aux_loss, *extra = out
+            support_meta_state = extra[0] if extra else None
 
             feats = feats / feats.norm(dim=-1, keepdim=True)
-            caps_embed = caps_embed / caps_embed.norm(dim=-1, keepdim=True) 
+            caps_embed = caps_embed / caps_embed.norm(dim=-1, keepdim=True).clamp_min(1e-6)
             labels = torch.arange(len(targets)).to(device)
             logits = torch.matmul(feats, caps_embed.t()) 
             loss_i = F.cross_entropy(logits, labels)
@@ -104,26 +114,92 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                 ord_sem_loss = torch.tensor(0.0, device=device)
    
             
-            loss_fine = 0  
-            loss_sub = 0 
-            loss_basic = 0
+            loss_fine = torch.zeros((), device=device)
+            loss_sub = torch.zeros((), device=device)
+            loss_basic = torch.zeros((), device=device)
 
             if leaf_labels.shape[0] > 0:
                 # supervision for samples who have fine-grained labels. 
-                select_leaf_output = torch.index_select(outputs, 0, leaf_labels.squeeze())
-                select_leaf_labels = torch.index_select(fine_targets, 0, leaf_labels.squeeze())
+                leaf_index = leaf_labels.flatten()
+                select_leaf_output = torch.index_select(outputs, 0, leaf_index)
+                select_leaf_labels = torch.index_select(fine_targets, 0, leaf_index)
                 loss_fine += (F.cross_entropy(select_leaf_output, select_leaf_labels))
     
             if sub_labels.shape[0] > 0:
                 # supervision for samples who have subordinate labels. 
-                select_sub_labels = torch.index_select(sub_targets, 0, sub_labels.squeeze())
-                select_sub_output = torch.index_select(sub_out, 0, sub_labels.squeeze())
+                sub_index = sub_labels.flatten()
+                select_sub_labels = torch.index_select(sub_targets, 0, sub_index)
+                select_sub_output = torch.index_select(sub_out, 0, sub_index)
                 loss_sub += (F.cross_entropy(select_sub_output, select_sub_labels))
 
             loss_basic = (F.cross_entropy(basic_out, basic_targets))
 
-                
-        loss = loss_fine + loss_sub + loss_basic + sim_loss * args.sim_loss_weight + part_aux_loss * args.part_aux_weight + fam_sem_loss * args.family_sem_weight + ord_sem_loss * args.order_sem_weight
+        meta_stats = {}
+        meta_real_loss = torch.zeros((), device=device)
+        meta_active = (
+            getattr(args, 'enable_bilevel', False)
+            and epoch >= getattr(args, 'meta_start_epoch', 0)
+        )
+        if meta_active:
+            if query_samples is None:
+                raise RuntimeError(
+                    "--enable-bilevel requires TwoViewTransform for the training dataset"
+                )
+            if meta_optimizer is None:
+                raise RuntimeError("meta optimizer was not constructed")
+            core_model = model.module if hasattr(model, 'module') else model
+            if support_meta_state is None:
+                raise RuntimeError("model did not return a bilevel semantic state")
+
+            # Query features are evaluation evidence for the virtual support
+            # update.  Backbone gradients are intentionally disabled here.
+            with torch.no_grad():
+                with torch.cuda.amp.autocast():
+                    query_out = model(query_samples, caps_model_embed, compute_hvp=False)
+                query_meta_state = query_out[-1]
+
+            # Meta step: exact hypergradient of the one-step unrolled objective.
+            # Only phi (the policy) is updated; theta/psi are untouched here.
+            with torch.cuda.amp.autocast(enabled=False):
+                meta_loss, meta_stats = core_model.bilevel.meta_objective(
+                    support_meta_state,
+                    query_meta_state,
+                    inner_lr=args.meta_inner_lr,
+                    q_mode=args.meta_q,
+                    kl_weight=args.meta_kl_weight,
+                )
+            policy_params = tuple(core_model.bilevel.policy.parameters())
+            policy_grads = torch.autograd.grad(
+                meta_loss, policy_params, allow_unused=False
+            )
+            meta_optimizer.zero_grad(set_to_none=True)
+            for param, grad in zip(policy_params, policy_grads):
+                param.grad = grad.detach()
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                    param.grad.div_(dist.get_world_size())
+            if args.meta_clip_grad is not None:
+                torch.nn.utils.clip_grad_norm_(policy_params, args.meta_clip_grad)
+            meta_optimizer.step()
+            meta_optimizer.zero_grad(set_to_none=True)
+
+            # Real model step: p is recomputed after the meta update and detached
+            # inside this loss, so no direct weighted-error gradient reaches phi.
+            meta_real_loss, real_stats = core_model.bilevel.real_weighted_alignment(
+                support_meta_state
+            )
+            meta_stats.update(real_stats)
+
+        loss = (
+            loss_fine
+            + loss_sub
+            + loss_basic
+            + sim_loss * args.sim_loss_weight
+            + part_aux_loss * args.part_aux_weight
+            + fam_sem_loss * args.family_sem_weight
+            + ord_sem_loss * args.order_sem_weight
+            + meta_real_loss * getattr(args, 'meta_real_weight', 0.0)
+        )
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
@@ -146,9 +222,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         metric_logger.update(basic_loss=loss_basic.item())
         metric_logger.update(sim_loss=sim_loss.item())
         metric_logger.update(part_aux_loss=part_aux_loss.item())
+        if meta_stats:
+            for key, value in meta_stats.items():
+                metric_logger.update(**{key: value.item()})
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
-        del feats, caps_embed, loss_i, loss_t, sim_loss, logits
+        del feats, caps_embed, caps_model_embed, loss_i, loss_t, sim_loss, logits, support_samples
+        if query_samples is not None:
+            del query_samples
         del samples, targets, outputs, loss
         torch.cuda.empty_cache()
 
@@ -200,4 +281,3 @@ def evaluate(data_loader, model, device, n_classes=3, texts=None):
         .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.sploss, fmlosses=metric_logger.subordloss, basiclosses=metric_logger.manuloss,
                 subtop1=metric_logger.sub_acc1, manutop1=metric_logger.basic_acc1))
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
