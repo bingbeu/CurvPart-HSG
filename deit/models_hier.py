@@ -12,6 +12,7 @@ from timm.models.layers import trunc_normal_
 from timm.models.layers.helpers import to_2tuple
 
 from semantic_part_v4 import SemanticPartTokenGeneratorV4
+from semantic_bilevel import BilevelSemanticController
 
 
 __all__ = [
@@ -34,6 +35,14 @@ class HierVisionTransformer(VisionTransformer):
         curv_reg_weight = kwargs.pop('curv_reg_weight', 0.05)
         text_dim = kwargs.pop('text_dim', 512)
         proto_align_weight = kwargs.pop('proto_align_weight', 0.1)
+        enable_bilevel = kwargs.pop('enable_bilevel', False)
+        semantic_rank = kwargs.pop('semantic_rank', 64)
+        meta_adapter_rank = kwargs.pop('meta_adapter_rank', 64)
+        meta_policy_hidden = kwargs.pop('meta_policy_hidden', 128)
+        meta_policy_tau = kwargs.pop('meta_policy_tau', 1.0)
+        meta_reference_mix = kwargs.pop('meta_reference_mix', 0.5)
+        semantic_diversity_weight = kwargs.pop('semantic_diversity_weight', 0.01)
+        semantic_bridge_weight = kwargs.pop('semantic_bridge_weight', 0.1)
 
         super().__init__(*args, **kwargs)
         #self.pos_embed = nn.Parameter(torch.randn(1, self.embed_len, self.embed_dim) * .02)
@@ -86,6 +95,24 @@ class HierVisionTransformer(VisionTransformer):
         self.caption_proj.apply(self._init_weights)
         self.proto_align_weight = proto_align_weight
 
+        # V5: visual/text semantic bridge + shared fast adapter + meta policy.
+        # Classification always uses visual semantic tokens, so train and test
+        # follow the same path. Captions are only a training-time teacher.
+        self.enable_bilevel = bool(enable_bilevel)
+        self.semantic_bridge_weight = float(semantic_bridge_weight)
+        if self.enable_bilevel:
+            self.bilevel = BilevelSemanticController(
+                dim=self.embed_dim,
+                text_dim=text_dim,
+                num_parts=num_parts,
+                semantic_rank=semantic_rank,
+                adapter_rank=meta_adapter_rank,
+                policy_hidden_dim=meta_policy_hidden,
+                policy_tau=meta_policy_tau,
+                reference_mix=meta_reference_mix,
+                diversity_weight=semantic_diversity_weight,
+            )
+
     def forward_features(self, x):
         # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
         B = x.shape[0]
@@ -114,26 +141,60 @@ class HierVisionTransformer(VisionTransformer):
        
         return intermediates
 
-    def forward(self, x, caps_embed=None):
+    def forward(self, x, caps_embed=None, compute_hvp=None):
         intermediates = self.forward_features(x)
         if self.len_classes == 3:
             B = x.shape[0]
             # 用最后一层 patch tokens 作为 V4 的视觉输入
             x_tokens = intermediates[4][:, 1:]                     # (B, 196, embed_dim)
-            category = self.category_token.expand(B, -1, -1)      # (B, 1, embed_dim)
-            if caps_embed is not None:
-                # 训练期：属性语义 = caption 文本投影
-                attr_sem = self.caption_proj(caps_embed).unsqueeze(1)
-            else:
-                # 推理期：属性语义 = 学习到的文本原型（无逐样本文本，避免泄露类别）
-                attr_sem = self.attr_proto.expand(B, -1, -1)
+            cls_s = self.norm(intermediates[4][:, 0])              # fine-level CLS
 
-            part_tokens, aux = self.part_gen(x_tokens, [category, attr_sem], return_aux=True)
-            part_feat = part_tokens.mean(dim=1)                    # (B, embed_dim)
+            visual_semantics = None
+            text_semantics = None
+            meta_state = None
+            if self.enable_bilevel:
+                # P distinct visual semantic tokens are used in both train/eval.
+                visual_semantics = self.bilevel.visual_semantics(cls_s)
+                text_semantics = (
+                    self.bilevel.text_semantics(caps_embed)
+                    if caps_embed is not None else None
+                )
+                category = visual_semantics.mean(dim=1, keepdim=True)
+                attr_sem = visual_semantics
+            else:
+                category = self.category_token.expand(B, -1, -1)
+                if caps_embed is not None:
+                    attr_sem = self.caption_proj(caps_embed).unsqueeze(1)
+                else:
+                    attr_sem = self.attr_proto.expand(B, -1, -1)
+
+            part_tokens, aux = self.part_gen(
+                x_tokens,
+                [category, attr_sem],
+                return_aux=True,
+                compute_hvp=compute_hvp,
+            )
+            if self.enable_bilevel:
+                part_feat, _ = self.bilevel.pool_parts(
+                    part_tokens,
+                    visual_semantics,
+                    aux['part_curvature'],
+                )
+                target_semantics = (
+                    text_semantics if text_semantics is not None else visual_semantics
+                )
+                meta_state = self.bilevel.make_state(
+                    part_tokens,
+                    visual_semantics,
+                    target_semantics,
+                    aux['part_curvature'],
+                )
+            else:
+                part_feat = part_tokens.mean(dim=1)
+
             # [E2] part 作为残差 delta，零门控初始等价 baseline；第一轮只让 fine 层用 part
             delta = self.part_adapter(part_feat)                  # (B, embed_dim)
             gate = torch.tanh(self.part_gate)                     # (3,)，初始 0
-            cls_s = self.norm(intermediates[4][:, 0])             # 物种级 CLS
             cls_f = self.norm(intermediates[3][:, 0])             # 科级 CLS
             cls_o = self.norm(intermediates[2][:, 0])             # 目级 CLS
             out = self.head(cls_s + gate[0] * delta)
@@ -148,13 +209,28 @@ class HierVisionTransformer(VisionTransformer):
             order_feat = self.order_proj(cls_o)     # (B, 512)
 
             part_aux_loss = aux['part_aux_loss']
+            if self.enable_bilevel:
+                bridge_loss, _ = self.bilevel.bridge_loss(
+                    visual_semantics, text_semantics
+                )
+                part_aux_loss = (
+                    part_aux_loss
+                    + self.semantic_bridge_weight * bridge_loss
+                )
             # 训练期把属性原型拉向 caption 均值，使推理期的原型有意义
-            if caps_embed is not None and self.proto_align_weight > 0:
+            if (
+                not self.enable_bilevel
+                and caps_embed is not None
+                and self.proto_align_weight > 0
+            ):
                 proto = self.caption_proj(caps_embed).mean(dim=0, keepdim=True)   # (1, embed_dim)
                 proto_align = (1.0 - F.cosine_similarity(self.attr_proto, proto, dim=-1)).mean()
                 part_aux_loss = part_aux_loss + self.proto_align_weight * proto_align
 
-            return out, family_out, manu_out, feats, family_feat, order_feat, part_aux_loss
+            return (
+                out, family_out, manu_out, feats, family_feat, order_feat,
+                part_aux_loss, meta_state,
+            )
 
         else:
             out = self.norm(intermediates[3][:, 0])
@@ -167,6 +243,13 @@ class HierVisionTransformer(VisionTransformer):
         # 门控(0 维标量)/可学习 token 不落入 timm 的 decay 组（timm 只用 len(shape)==1 判定）
         nd = set(super().no_weight_decay())
         nd.update({'category_token', 'attr_proto', 'part_gate'})
+        if self.enable_bilevel:
+            nd.update({
+                'bilevel.bridge.anchors',
+                'bilevel.bridge.part_basis',
+                'bilevel.bridge.visual_scale',
+                'bilevel.bridge.text_scale',
+            })
         for name, _ in self.part_gen.named_parameters():
             if any(k in name for k in ('alpha', 'gamma', 'part_queries')):
                 nd.add('part_gen.' + name)
