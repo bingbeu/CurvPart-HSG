@@ -58,6 +58,9 @@ python deit/main_hier_partial.py \
   --finetune deit_small_patch16_224-cd65a155.pth \
   --enable-bilevel \
   --num-parts 8 \
+  --lam-cls 0.0 \
+  --lam-attr 1.0 \
+  --proto-align-weight 0.0 \
   --meta-start-epoch 5 \
   --meta-inner-lr 0.1 \
   --meta-lr 1e-4 \
@@ -97,4 +100,3 @@ The tests verify that:
 In the paper, describe this as an explicit bilevel objective optimized with a
 one-step differentiable unrolling approximation. Do not claim that the inner
 argmin is solved exactly.
-
