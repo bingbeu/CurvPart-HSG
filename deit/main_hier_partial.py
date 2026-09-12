@@ -229,6 +229,15 @@ def get_args_parser():
     parser.add_argument('--meta-start-epoch', default=5, type=int,
                         help='warm up semantic tokens before enabling the meta step')
     parser.add_argument('--meta-q', default='uniform', choices=['uniform', 'hvp'])
+    parser.add_argument('--meta-task-weight', default=1.0, type=float,
+                        help='downstream hierarchical query loss in the outer objective')
+    parser.add_argument('--meta-semantic-weight', default=0.1, type=float,
+                        help='fixed-q query semantic evaluator weight')
+    parser.add_argument('--meta-fine-weight', default=1.0, type=float)
+    parser.add_argument('--meta-family-weight', default=0.5, type=float)
+    parser.add_argument('--meta-basic-weight', default=0.5, type=float)
+    parser.add_argument('--allow-random-init', action='store_true',
+                        help='explicitly allow bilevel training without pretrained weights')
     
     
     return parser
@@ -241,6 +250,21 @@ def main(args):
 
     if args.distillation_type != 'none' and args.finetune and not args.eval:
         raise NotImplementedError("Finetuning with distillation not yet supported")
+
+    if (
+        args.enable_bilevel
+        and not args.eval
+        and not args.finetune
+        and not args.resume
+        and not args.pretrained
+        and not args.allow_random_init
+    ):
+        raise ValueError(
+            "Bilevel fine-grained training requires ImageNet initialization. "
+            "Pass --finetune /path/to/deit_small_patch16_224-cd65a155.pth, "
+            "--resume a compatible checkpoint, or explicitly acknowledge an "
+            "ablation with --allow-random-init."
+        )
 
     device = torch.device(args.device)
 

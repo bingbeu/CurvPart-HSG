@@ -2,6 +2,17 @@
 By [Seulki Park](https://sites.google.com/view/seulkipark/home), [Zilin Wang](https://wayne2wang.github.io/), and [Stella X. Yu](https://web.eecs.umich.edu/~stellayu/)   
 Official implementation of ["Free-Grained Hierarchical Visual Recognition"](https://arxiv.org/pdf/2510.14737), CVPR, 2026.
 
+## CurvPart-HSG V7
+
+This fork adds a task-feedback semantic closed loop. A curvature-aware policy
+selects support-view part alignment updates of a shared semantic adapter, while
+an independently augmented query view evaluates the virtual adapter with the
+available-label hierarchical classification objective and a fixed-reference
+semantic loss. The same adapter is used during inference, and learned policy
+weights are absent from the query evaluator. See
+[`BILEVEL_SEMANTIC_LOOP.md`](BILEVEL_SEMANTIC_LOOP.md) for the objective,
+invariants and a complete Aircraft command.
+
 
 ## 🔍 Overview
 <table>
