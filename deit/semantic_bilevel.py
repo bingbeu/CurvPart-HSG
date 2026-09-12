@@ -10,7 +10,7 @@ on a separately augmented query view.
 """
 
 from collections import OrderedDict
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -247,11 +247,37 @@ class BilevelSemanticController(nn.Module):
         target_semantics: torch.Tensor,
         params: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        adapted = self.adapt_parts(visual_tokens, params)
+        target = target_semantics.to(dtype=adapted.dtype)
+        return 1.0 - F.cosine_similarity(adapted, target, dim=-1)
+
+    def adapt_parts(
+        self,
+        part_tokens: torch.Tensor,
+        params: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Apply the real lower-level variable used by training and inference."""
+        adapter_dtype = next(self.adapter.parameters()).dtype
+        tokens = part_tokens.to(dtype=adapter_dtype)
         if params is None:
-            adapted = self.adapter(visual_tokens)
+            return self.adapter(tokens)
+        return self.adapter.functional_forward(tokens, params)
+
+    @staticmethod
+    def reference_distribution(
+        error: torch.Tensor,
+        curvature: torch.Tensor,
+        q_mode: str,
+    ) -> torch.Tensor:
+        """Build a stopped evaluator distribution independent of the policy."""
+        if q_mode == "uniform":
+            q = torch.full_like(error, 1.0 / error.size(1))
+        elif q_mode == "hvp":
+            q = curvature.squeeze(-1) if curvature.dim() == 3 else curvature
+            q = q / q.sum(dim=1, keepdim=True).clamp_min(1e-6)
         else:
-            adapted = self.adapter.functional_forward(visual_tokens, params)
-        return 1.0 - F.cosine_similarity(adapted, target_semantics, dim=-1)
+            raise ValueError("meta q_mode must be 'uniform' or 'hvp'")
+        return q.detach()
 
     def policy_distribution(
         self,
@@ -261,10 +287,11 @@ class BilevelSemanticController(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         # Inputs are stopped while phi remains differentiable.  This makes p a
         # gradient selector instead of adding e_i * d p_i / d x to the inner step.
+        policy_dtype = next(self.policy.parameters()).dtype
         return self.policy(
-            part_tokens.detach(),
-            policy_semantics.detach(),
-            curvature.detach(),
+            part_tokens.detach().to(dtype=policy_dtype),
+            policy_semantics.detach().to(dtype=policy_dtype),
+            curvature.detach().to(dtype=policy_dtype),
         )
 
     def pool_parts(
@@ -276,7 +303,11 @@ class BilevelSemanticController(nn.Module):
         p, stats = self.policy_distribution(
             part_tokens, policy_semantics, curvature
         )
-        pooled = (p.detach().unsqueeze(-1) * part_tokens).sum(dim=1)
+        # The same adapter is used by the virtual inner update, the real model
+        # update and inference.  Without this link, a better virtual alignment
+        # would not imply a better downstream representation.
+        adapted = self.adapt_parts(part_tokens)
+        pooled = (p.detach().unsqueeze(-1) * adapted).sum(dim=1)
         return pooled, stats
 
     def meta_objective(
@@ -286,8 +317,18 @@ class BilevelSemanticController(nn.Module):
         inner_lr: float,
         q_mode: str = "uniform",
         kl_weight: float = 0.01,
+        outer_task_fn: Optional[
+            Callable[[Dict[str, torch.Tensor], Dict[str, torch.Tensor], torch.Tensor], torch.Tensor]
+        ] = None,
+        task_weight: float = 1.0,
+        semantic_weight: float = 0.1,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Return a true hypergradient-bearing one-step outer objective."""
+        """Return a hypergradient-bearing task-feedback outer objective.
+
+        ``p_phi`` appears only in the support-view inner update.  The query
+        evaluator uses a fixed ``q`` and an optional downstream task callback,
+        so the policy cannot minimize the original error by direct weighting.
+        """
         support_tokens = support["part_tokens"].detach().float()
         support_policy_sem = support["policy_semantics"].detach().float()
         support_target_sem = support["target_semantics"].detach().float()
@@ -324,26 +365,36 @@ class BilevelSemanticController(nn.Module):
             query_tokens, query_target_sem, fast_params
         )
 
-        if q_mode == "uniform":
-            q = torch.full_like(query_error_after, 1.0 / self.num_parts)
-        elif q_mode == "hvp":
-            q = query_curvature.squeeze(-1)
-            q = q / q.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        else:
-            raise ValueError("meta q_mode must be 'uniform' or 'hvp'")
-        q = q.detach()
+        q = self.reference_distribution(
+            query_error_after, query_curvature, q_mode
+        )
         outer_align = (q * query_error_after).sum(dim=1).mean()
+
+        outer_task = outer_align.new_zeros(())
+        task_before = outer_align.new_zeros(())
+        if outer_task_fn is not None:
+            outer_task = outer_task_fn(query, fast_params, q)
+            # Only a diagnostic baseline; it must not create another path into
+            # the policy or retain a needless graph.
+            with torch.no_grad():
+                task_before = outer_task_fn(query, base_params, q).detach()
 
         uniform = torch.full_like(p, 1.0 / self.num_parts)
         policy_kl = (
             p * (p.clamp_min(1e-8).log() - uniform.log())
         ).sum(dim=1).mean()
-        meta_loss = outer_align + float(kl_weight) * policy_kl
+        meta_loss = (
+            float(task_weight) * outer_task
+            + float(semantic_weight) * outer_align
+            + float(kl_weight) * policy_kl
+        )
 
         before = (q * query_error_before.detach()).sum(dim=1).mean()
         improvement = before - outer_align.detach()
         stats = {
             "meta_loss": meta_loss.detach(),
+            "meta_outer_task": outer_task.detach(),
+            "meta_task_improvement": task_before - outer_task.detach(),
             "meta_outer_align": outer_align.detach(),
             "meta_inner_align": inner_loss.detach(),
             "meta_improvement": improvement,

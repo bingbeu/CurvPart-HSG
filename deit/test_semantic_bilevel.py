@@ -1,4 +1,4 @@
-"""Small CPU tests for the V5 bilevel gradient invariants."""
+"""Small CPU tests for the task-feedback bilevel gradient invariants."""
 
 import unittest
 
@@ -72,7 +72,44 @@ class BilevelSemanticControllerTest(unittest.TestCase):
         self.assertTrue(torch.all(p >= expected_floor - 1e-7))
         self.assertTrue(torch.allclose(p.sum(dim=1), torch.ones(self.batch)))
 
+    def test_downstream_outer_task_carries_policy_hypergradient(self):
+        support = self._state(4)
+        query = self._state(5)
+        target = torch.randn(self.batch, self.dim)
+
+        def outer_task_fn(state, params, reference):
+            adapted = self.controller.adapt_parts(
+                state["part_tokens"].detach().float(), params
+            )
+            pooled = (reference.unsqueeze(-1) * adapted).sum(dim=1)
+            return torch.nn.functional.mse_loss(pooled, target)
+
+        meta_loss, stats = self.controller.meta_objective(
+            support,
+            query,
+            inner_lr=0.1,
+            outer_task_fn=outer_task_fn,
+            task_weight=1.0,
+            semantic_weight=0.0,
+            kl_weight=0.0,
+        )
+        policy_params = tuple(self.controller.policy.parameters())
+        meta_grads = torch.autograd.grad(meta_loss, policy_params)
+        self.assertGreater(sum(g.abs().sum() for g in meta_grads).item(), 0.0)
+        self.assertIn("meta_outer_task", stats)
+
+    def test_inference_pool_uses_shared_inner_adapter(self):
+        state = self._state(6)
+        pooled_before, _ = self.controller.pool_parts(
+            state["part_tokens"], state["policy_semantics"], state["curvature"]
+        )
+        with torch.no_grad():
+            self.controller.adapter.up.bias.add_(0.25)
+        pooled_after, _ = self.controller.pool_parts(
+            state["part_tokens"], state["policy_semantics"], state["curvature"]
+        )
+        self.assertFalse(torch.allclose(pooled_before, pooled_after))
+
 
 if __name__ == "__main__":
     unittest.main()
-

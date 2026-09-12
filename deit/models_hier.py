@@ -148,6 +148,8 @@ class HierVisionTransformer(VisionTransformer):
             # 用最后一层 patch tokens 作为 V4 的视觉输入
             x_tokens = intermediates[4][:, 1:]                     # (B, 196, embed_dim)
             cls_s = self.norm(intermediates[4][:, 0])              # fine-level CLS
+            cls_f = self.norm(intermediates[3][:, 0])              # family-level CLS
+            cls_o = self.norm(intermediates[2][:, 0])              # order-level CLS
 
             visual_semantics = None
             text_semantics = None
@@ -189,17 +191,23 @@ class HierVisionTransformer(VisionTransformer):
                     target_semantics,
                     aux['part_curvature'],
                 )
+                meta_state.update({
+                    'fine_cls': cls_s,
+                    'family_cls': cls_f,
+                    'basic_cls': cls_o,
+                })
             else:
                 part_feat = part_tokens.mean(dim=1)
 
             # [E2] part 作为残差 delta，零门控初始等价 baseline；第一轮只让 fine 层用 part
             delta = self.part_adapter(part_feat)                  # (B, embed_dim)
             gate = torch.tanh(self.part_gate)                     # (3,)，初始 0
-            cls_f = self.norm(intermediates[3][:, 0])             # 科级 CLS
-            cls_o = self.norm(intermediates[2][:, 0])             # 目级 CLS
             out = self.head(cls_s + gate[0] * delta)
-            family_out = self.family_head(cls_f)
-            manu_out = self.manufacturer_head(cls_o)
+            # All three gates are zero-initialized, hence this remains exactly
+            # recoverable to E2 while allowing the outer hierarchical task to
+            # judge whether a semantic update benefits each level.
+            family_out = self.family_head(cls_f + gate[1] * delta)
+            manu_out = self.manufacturer_head(cls_o + gate[2] * delta)
 
             feats = intermediates[4][:, 1:]
             feats = self.feats_layer(feats.view(feats.size(0), -1))
@@ -237,6 +245,59 @@ class HierVisionTransformer(VisionTransformer):
             out = self.head(out)
             family_out = self.family_head(intermediates[4][:, 0])
             return out, family_out
+
+    def bilevel_task_loss(
+        self,
+        state,
+        adapter_params,
+        reference,
+        fine_targets,
+        sub_targets,
+        basic_targets,
+        leaf_index,
+        sub_index,
+        fine_weight=1.0,
+        family_weight=0.5,
+        basic_weight=0.5,
+    ):
+        """Evaluate a virtual semantic update using fixed-q task logits.
+
+        The weighting policy is intentionally absent from this evaluator.
+        ``reference`` is uniform or stopped-HVP and the classifier parameters
+        are not part of the virtual update; only the shared semantic adapter is.
+        """
+        adapted = self.bilevel.adapt_parts(
+            state['part_tokens'].detach().float(), adapter_params
+        )
+        q = reference.detach().to(dtype=adapted.dtype)
+        part_feat = (q.unsqueeze(-1) * adapted).sum(dim=1)
+        delta = self.part_adapter(part_feat)
+        gate = torch.tanh(self.part_gate.float())
+
+        fine_logits = self.head(state['fine_cls'].detach().float() + gate[0] * delta)
+        family_logits = self.family_head(
+            state['family_cls'].detach().float() + gate[1] * delta
+        )
+        basic_logits = self.manufacturer_head(
+            state['basic_cls'].detach().float() + gate[2] * delta
+        )
+
+        loss = fine_logits.new_zeros(())
+        if leaf_index.numel() > 0 and float(fine_weight) != 0.0:
+            loss = loss + float(fine_weight) * F.cross_entropy(
+                fine_logits.index_select(0, leaf_index),
+                fine_targets.index_select(0, leaf_index),
+            )
+        if sub_index.numel() > 0 and float(family_weight) != 0.0:
+            loss = loss + float(family_weight) * F.cross_entropy(
+                family_logits.index_select(0, sub_index),
+                sub_targets.index_select(0, sub_index),
+            )
+        if float(basic_weight) != 0.0:
+            loss = loss + float(basic_weight) * F.cross_entropy(
+                basic_logits, basic_targets
+            )
+        return loss
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -495,4 +556,3 @@ def deit_conv_base_patch16_224(pretrained=False, **kwargs):
         norm_layer=partial(nn.LayerNorm, eps=1e-6), embed_layer=ConvStem, **kwargs)
     model.default_cfg = _cfg()
     return model
-
